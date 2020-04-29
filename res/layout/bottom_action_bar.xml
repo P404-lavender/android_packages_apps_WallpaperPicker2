@@ -1,6 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
-
+<?xml version="1.0" encoding="utf-8"?><!--
      Copyright (C) 2020 The Android Open Source Project
 
      Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,8 +13,11 @@
      See the License for the specific language governing permissions and
      limitations under the License.
 -->
-<resources>
-    <color name="preview_pager_background">@color/google_grey900</color>
-    <color name="edit_background_base">@color/material_white_100</color>
-    <color name="action_bar_bottom_sheet_text_color">@color/material_white_100</color>
-</resources>
+<com.android.wallpaper.widget.BottomActionBar
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/bottom_actionbar"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:layout_gravity="bottom"
+    android:elevation="@dimen/bottom_action_bar_elevation"
+    android:visibility="gone" />

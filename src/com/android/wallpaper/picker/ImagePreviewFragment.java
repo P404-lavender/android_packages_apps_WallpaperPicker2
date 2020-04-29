@@ -37,6 +37,7 @@ import androidx.fragment.app.FragmentActivity;
 
 import com.android.wallpaper.R;
 import com.android.wallpaper.asset.Asset;
+import com.android.wallpaper.model.WallpaperInfo;
 import com.android.wallpaper.module.WallpaperPersister.Destination;
 import com.android.wallpaper.module.WallpaperPersister.SetWallpaperCallback;
 import com.android.wallpaper.util.ScreenSizeCalculator;
@@ -294,50 +295,14 @@ public class ImagePreviewFragment extends PreviewFragment {
     }
 
     private Rect calculateCropRect() {
-        // Calculate Rect of wallpaper in physical pixel terms (i.e., scaled to current zoom).
         float wallpaperZoom = mFullResImageView.getScale();
-        int scaledWallpaperWidth = (int) (mRawWallpaperSize.x * wallpaperZoom);
-        int scaledWallpaperHeight = (int) (mRawWallpaperSize.y * wallpaperZoom);
+        Context context = requireContext().getApplicationContext();
+        Display defaultDisplay = requireActivity().getWindowManager().getDefaultDisplay();
         Rect rect = new Rect();
         mFullResImageView.visibleFileRect(rect);
-        int scrollX = (int) (rect.left * wallpaperZoom);
-        int scrollY = (int) (rect.top * wallpaperZoom);
 
-        rect.set(0, 0, scaledWallpaperWidth, scaledWallpaperHeight);
-
-        Display defaultDisplay = requireActivity().getWindowManager().getDefaultDisplay();
-        Point screenSize = ScreenSizeCalculator.getInstance().getScreenSize(defaultDisplay);
-        // Crop rect should start off as the visible screen and then include extra width and height
-        // if available within wallpaper at the current zoom.
-        Rect cropRect = new Rect(scrollX, scrollY, scrollX + screenSize.x, scrollY + screenSize.y);
-
-        Point defaultCropSurfaceSize = WallpaperCropUtils.getDefaultCropSurfaceSize(
-                getResources(), defaultDisplay);
-        int extraWidth = defaultCropSurfaceSize.x - screenSize.x;
-        int extraHeightTopAndBottom = (int) ((defaultCropSurfaceSize.y - screenSize.y) / 2f);
-
-        // Try to increase size of screenRect to include extra width depending on the layout
-        // direction.
-        if (isRtl()) {
-            cropRect.left = Math.max(cropRect.left - extraWidth, rect.left);
-        } else {
-            cropRect.right = Math.min(cropRect.right + extraWidth, rect.right);
-        }
-
-        // Try to increase the size of the cropRect to to include extra height.
-        int availableExtraHeightTop = cropRect.top - Math.max(
-                rect.top,
-                cropRect.top - extraHeightTopAndBottom);
-        int availableExtraHeightBottom = Math.min(
-                rect.bottom,
-                cropRect.bottom + extraHeightTopAndBottom) - cropRect.bottom;
-
-        int availableExtraHeightTopAndBottom =
-                Math.min(availableExtraHeightTop, availableExtraHeightBottom);
-        cropRect.top -= availableExtraHeightTopAndBottom;
-        cropRect.bottom += availableExtraHeightTopAndBottom;
-
-        return cropRect;
+        return WallpaperCropUtils.calculateCropRect(context, defaultDisplay, mRawWallpaperSize,
+                rect, wallpaperZoom);
     }
 
     @Override
@@ -346,7 +311,7 @@ public class ImagePreviewFragment extends PreviewFragment {
                 destination, mFullResImageView.getScale(), calculateCropRect(),
                 new SetWallpaperCallback() {
                     @Override
-                    public void onSuccess() {
+                    public void onSuccess(WallpaperInfo wallpaperInfo) {
                         finishActivityWithResultOk();
                     }
 

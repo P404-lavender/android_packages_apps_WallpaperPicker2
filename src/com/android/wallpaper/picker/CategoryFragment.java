@@ -15,6 +15,9 @@
  */
 package com.android.wallpaper.picker;
 
+import static android.view.View.MeasureSpec.EXACTLY;
+import static android.view.View.MeasureSpec.makeMeasureSpec;
+
 import android.app.Activity;
 import android.app.ProgressDialog;
 import android.content.Context;
@@ -22,18 +25,27 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Point;
 import android.graphics.PorterDuff.Mode;
+import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build.VERSION;
 import android.os.Build.VERSION_CODES;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.service.wallpaper.WallpaperService;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
 import android.view.LayoutInflater;
+import android.view.SurfaceControlViewHost;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.View.OnClickListener;
 import android.view.ViewGroup;
+import android.view.animation.AnimationUtils;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
@@ -44,12 +56,16 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 import androidx.cardview.widget.CardView;
+import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.RecyclerView;
 import androidx.viewpager.widget.PagerAdapter;
+import androidx.viewpager.widget.ViewPager;
 
+import com.android.systemui.shared.system.SurfaceViewRequestUtils;
 import com.android.wallpaper.R;
 import com.android.wallpaper.config.Flags;
 import com.android.wallpaper.model.Category;
+import com.android.wallpaper.model.LiveWallpaperInfo;
 import com.android.wallpaper.model.WallpaperInfo;
 import com.android.wallpaper.module.CurrentWallpaperInfoFactory;
 import com.android.wallpaper.module.CurrentWallpaperInfoFactory.WallpaperInfoCallback;
@@ -64,8 +80,14 @@ import com.android.wallpaper.module.WallpaperRotationRefresher.Listener;
 import com.android.wallpaper.picker.CategorySelectorFragment.CategorySelectorFragmentHost;
 import com.android.wallpaper.picker.MyPhotosStarter.MyPhotosStarterProvider;
 import com.android.wallpaper.picker.MyPhotosStarter.PermissionChangedListener;
+import com.android.wallpaper.picker.individual.IndividualPickerFragment.ThumbnailUpdater;
 import com.android.wallpaper.util.DisplayMetricsRetriever;
+import com.android.wallpaper.util.PreviewUtils;
 import com.android.wallpaper.util.ScreenSizeCalculator;
+import com.android.wallpaper.util.TileSizeCalculator;
+import com.android.wallpaper.util.WallpaperConnection;
+import com.android.wallpaper.util.WallpaperConnection.WallpaperConnectionListener;
+import com.android.wallpaper.widget.LiveTileOverlay;
 import com.android.wallpaper.widget.PreviewPager;
 
 import com.bumptech.glide.Glide;
@@ -79,7 +101,8 @@ import java.util.List;
 /**
  * Displays the Main UI for picking a category of wallpapers to choose from.
  */
-public class CategoryFragment extends ToolbarFragment implements CategorySelectorFragmentHost {
+public class CategoryFragment extends ToolbarFragment
+        implements CategorySelectorFragmentHost, ThumbnailUpdater {
 
     /**
      * Interface to be implemented by an Activity hosting a {@link CategoryFragment}
@@ -100,6 +123,7 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
     }
 
     private static final String TAG = "CategoryFragment";
+    private static final int MAX_ALPHA = 255;
 
     // The number of ViewHolders that don't pertain to category tiles.
     // Currently 2: one for the metadata section and one for the "Select wallpaper" header.
@@ -113,10 +137,20 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
     private ProgressDialog mRefreshWallpaperProgressDialog;
     private boolean mTestingMode;
     private ImageView mHomePreview;
+    private SurfaceView mWorkspaceSurface;
+    private SurfaceView mWallpaperSurface;
     private ImageView mLockscreenPreview;
     private PreviewPager mPreviewPager;
     private List<View> mWallPaperPreviews;
+    private WallpaperConnection mWallpaperConnection;
     private CategorySelectorFragment mCategorySelectorFragment;
+    private boolean mShowSelectedWallpaper;
+    private BottomSheetBehavior mBottomSheetBehavior;
+    private PreviewUtils mPreviewUtils;
+
+    // Home workspace surface is behind the app window, and so must the home image wallpaper like
+    // the live wallpaper. This view is rendered on mWallpaperSurface for home image wallpaper.
+    private ImageView mHomeImageWallpaper;
 
     public CategoryFragment() {
         mCategorySelectorFragment = new CategorySelectorFragment();
@@ -134,34 +168,60 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
         CardView homePreviewCard = (CardView) inflater.inflate(
                 R.layout.wallpaper_preview_card, null);
         mHomePreview = homePreviewCard.findViewById(R.id.wallpaper_preview_image);
+        mWorkspaceSurface = homePreviewCard.findViewById(R.id.workspace_surface);
+        mWallpaperSurface = homePreviewCard.findViewById(R.id.wallpaper_surface);
         mWallPaperPreviews.add(homePreviewCard);
 
         if (LockWallpaperStatusChecker.isLockWallpaperSet(getContext())) {
             CardView lockscreenPreviewCard = (CardView) inflater.inflate(
                     R.layout.wallpaper_preview_card, null);
             mLockscreenPreview = lockscreenPreviewCard.findViewById(R.id.wallpaper_preview_image);
+            lockscreenPreviewCard.findViewById(R.id.workspace_surface).setVisibility(View.GONE);
+            lockscreenPreviewCard.findViewById(R.id.wallpaper_surface).setVisibility(View.GONE);
             mWallPaperPreviews.add(lockscreenPreviewCard);
         }
 
         mPreviewPager = view.findViewById(R.id.wallpaper_preview_pager);
         mPreviewPager.setAdapter(new PreviewPagerAdapter(mWallPaperPreviews));
-        setupCurrentWallpaperPreview(view);
-
-        view.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+        mPreviewPager.setOnPageChangeListener(new ViewPager.OnPageChangeListener() {
+            int[] mLocation = new int[2];
+            Rect mHomePreviewRect = new Rect();
             @Override
-            public void onLayoutChange(View view, int left, int top, int right, int bottom,
-                                       int oldLeft, int oldTop, int oldRight, int oldBottom) {
-                View toolBar = view.findViewById(R.id.toolbar);
-                View fragmentContainer = view.findViewById(R.id.category_fragment_container);
-                int minimumHeight = view.getHeight()
-                        - toolBar.getHeight()
-                        - getResources().getDimensionPixelOffset(R.dimen.preview_pager_height);
-                BottomSheetBehavior.from(fragmentContainer).setPeekHeight(minimumHeight);
-                fragmentContainer.setMinimumHeight(minimumHeight);
-                fragmentContainer.getLayoutParams().height = view.getHeight() - toolBar.getHeight();
-                view.removeOnLayoutChangeListener(this);
+            public void onPageScrolled(int position, float positionOffset,
+                    int positionOffsetPixels) {
+                if (mWallpaperConnection != null) {
+                    mHomePreview.getLocationOnScreen(mLocation);
+                    mHomePreviewRect.set(0, 0, mHomePreview.getMeasuredWidth(),
+                            mHomePreview.getMeasuredHeight());
+                    mHomePreviewRect.offset(mLocation[0], mLocation[1]);
+                    mWallpaperConnection.updatePreviewPosition(mHomePreviewRect);
+                }
+            }
+
+            @Override
+            public void onPageSelected(int i) {
+            }
+
+            @Override
+            public void onPageScrollStateChanged(int i) {
             }
         });
+        setupCurrentWallpaperPreview(view);
+
+        View fragmentContainer = view.findViewById(R.id.category_fragment_container);
+        mBottomSheetBehavior = BottomSheetBehavior.from(fragmentContainer);
+        fragmentContainer.addOnLayoutChangeListener((containerView, left, top, right, bottom,
+                                                     oldLeft, oldTop, oldRight, oldBottom) -> {
+            int minimumHeight = containerView.getHeight() - mPreviewPager.getMeasuredHeight();
+            mBottomSheetBehavior.setPeekHeight(minimumHeight);
+            containerView.setMinimumHeight(minimumHeight);
+            ((CardView) mHomePreview.getParent())
+                    .setRadius(TileSizeCalculator.getPreviewCornerRadius(
+                            getActivity(), homePreviewCard.getMeasuredWidth()));
+        });
+
+        mPreviewUtils = new PreviewUtils(getContext(),
+                getString(R.string.grid_control_metadata_name));
 
         setUpToolbar(view);
 
@@ -170,6 +230,12 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
                 .replace(R.id.category_fragment_container, mCategorySelectorFragment)
                 .commitNow();
         return view;
+    }
+
+    @Override
+    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+        updateWallpaperSurface();
+        updateWorkspaceSurface();
     }
 
     @Override
@@ -190,12 +256,38 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
 
         // The wallpaper may have been set while this fragment was paused, so force refresh the current
         // wallpapers and presentation mode.
-        refreshCurrentWallpapers(/* MetadataHolder= */ null, /* forceRefresh= */ true);
+        if (!mShowSelectedWallpaper) {
+            refreshCurrentWallpapers(/* MetadataHolder= */ null, /* forceRefresh= */ true);
+        }
+        if (mWallpaperConnection != null) {
+            mWallpaperConnection.setVisibility(true);
+        }
+    }
+
+    @Override
+    public void onPause() {
+        super.onPause();
+        if (mWallpaperConnection != null) {
+            mWallpaperConnection.setVisibility(false);
+        }
+    }
+
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        if (mWallpaperConnection != null) {
+            mWallpaperConnection.disconnect();
+            mWallpaperConnection = null;
+        }
     }
 
     @Override
     public void onDestroy() {
         super.onDestroy();
+        if (mWallpaperConnection != null) {
+            mWallpaperConnection.disconnect();
+            mWallpaperConnection = null;
+        }
         if (mRefreshWallpaperProgressDialog != null) {
             mRefreshWallpaperProgressDialog.dismiss();
         }
@@ -222,6 +314,28 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
                 .addToBackStack(null)
                 .commit();
         getChildFragmentManager().executePendingTransactions();
+    }
+
+    @Override
+    public void updateThumbnail(WallpaperInfo wallpaperInfo) {
+        new android.os.Handler().post(() -> {
+            // A config change may have destroyed the activity since the refresh started, so check
+            // for that.
+            if (getActivity() == null) {
+                return;
+            }
+
+            updateThumbnail(wallpaperInfo, mHomePreview, true);
+            updateThumbnail(wallpaperInfo, mLockscreenPreview, false);
+            mShowSelectedWallpaper = true;
+            mBottomSheetBehavior.setState(BottomSheetBehavior.STATE_COLLAPSED);
+        });
+    }
+
+    @Override
+    public void restoreThumbnails() {
+        refreshCurrentWallpapers(/* MetadataHolder= */ null, /* forceRefresh= */ true);
+        mShowSelectedWallpaper = false;
     }
 
     /**
@@ -348,6 +462,10 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
         return (CategoryFragmentHost) getActivity();
     }
 
+    private Intent getWallpaperIntent(android.app.WallpaperInfo info) {
+        return new Intent(WallpaperService.SERVICE_INTERFACE)
+                .setClassName(info.getPackageName(), info.getServiceName());
+    }
     /**
      * Obtains the {@link WallpaperInfo} object(s) representing the wallpaper(s) currently set to the
      * device from the {@link CurrentWallpaperInfoFactory} and binds them to the provided
@@ -372,32 +490,15 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
                 new android.os.Handler().post(new Runnable() {
                     @Override
                     public void run() {
-                        // A config change may have destroyed the activity since the refresh started, so check
-                        // for that.
-                        if (getActivity() == null) {
+                        final Activity activity = getActivity();
+                        // A config change may have destroyed the activity since the refresh
+                        // started, so check for that.
+                        if (activity == null) {
                             return;
                         }
 
-                        UserEventLogger eventLogger =
-                                InjectorProvider.getInjector().getUserEventLogger(getActivity());
-                        homeWallpaper.getThumbAsset(getActivity().getApplicationContext())
-                                .loadDrawable(getActivity(),
-                                        mHomePreview,
-                                        getResources().getColor(R.color.secondary_color));
-                        mHomePreview.setOnClickListener(view -> {
-                            getFragmentHost().showViewOnlyPreview(homeWallpaper);
-                            eventLogger.logCurrentWallpaperPreviewed();
-                        });
-                        if (lockWallpaper != null) {
-                            lockWallpaper.getThumbAsset(getActivity().getApplicationContext())
-                                    .loadDrawable(getActivity(),
-                                            mLockscreenPreview,
-                                            getResources().getColor(R.color.secondary_color));
-                            mLockscreenPreview.setOnClickListener(view -> {
-                                getFragmentHost().showViewOnlyPreview(lockWallpaper);
-                                eventLogger.logCurrentWallpaperPreviewed();
-                            });
-                        }
+                        updateThumbnail(homeWallpaper, mHomePreview, true);
+                        updateThumbnail(lockWallpaper, mLockscreenPreview, false);
 
                         // The MetadataHolder may be null if the RecyclerView has not yet created the view
                         // holder.
@@ -408,6 +509,62 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
                 });
             }
         }, forceRefresh);
+    }
+
+    private void setUpLiveWallpaperPreview(WallpaperInfo homeWallpaper, ImageView previewView,
+            Drawable thumbnail) {
+        Activity activity = getActivity();
+        if (activity == null) {
+            return;
+        }
+        if (mWallpaperConnection != null) {
+            mWallpaperConnection.disconnect();
+        }
+        if (thumbnail != null) {
+            thumbnail.setBounds(previewView.getLeft(), previewView.getTop(), previewView.getRight(),
+                    previewView.getBottom());
+        }
+
+        Rect previewLocalRect = new Rect();
+        Rect previewGlobalRect = new Rect();
+        previewView.getLocalVisibleRect(previewLocalRect);
+        previewView.getGlobalVisibleRect(previewGlobalRect);
+        mWallpaperConnection = new WallpaperConnection(
+                getWallpaperIntent(homeWallpaper.getWallpaperComponent()), activity,
+                new WallpaperConnectionListener() {
+                    @Override
+                    public void onEngineShown() {
+                        final Drawable placeholder = previewView.getDrawable() == null
+                                ? new ColorDrawable(getResources().getColor(R.color.secondary_color,
+                                    activity.getTheme()))
+                                : previewView.getDrawable();
+                        LiveTileOverlay.INSTANCE.setForegroundDrawable(placeholder);
+                        LiveTileOverlay.INSTANCE.attach(previewView.getOverlay());
+                        previewView.animate()
+                                .setStartDelay(400)
+                                .setDuration(400)
+                                .setInterpolator(AnimationUtils.loadInterpolator(getContext(),
+                                        android.R.interpolator.fast_out_linear_in))
+                                .setUpdateListener(value -> placeholder.setAlpha(
+                                        (int) (MAX_ALPHA * (1 - value.getAnimatedFraction()))))
+                                .withEndAction(() -> {
+                                    LiveTileOverlay.INSTANCE.setForegroundDrawable(null);
+
+                                }).start();
+
+                    }
+                }, previewGlobalRect);
+
+        LiveTileOverlay.INSTANCE.update(new RectF(previewLocalRect),
+                ((CardView) previewView.getParent()).getRadius());
+
+        mWallpaperConnection.setVisibility(true);
+        previewView.post(() -> {
+            if (!mWallpaperConnection.connect()) {
+                mWallpaperConnection = null;
+                LiveTileOverlay.INSTANCE.detach(previewView.getOverlay());
+            }
+        });
     }
 
     /**
@@ -490,6 +647,102 @@ public class CategoryFragment extends ToolbarFragment implements CategorySelecto
         // width of the device's screen.
         return metrics.widthPixels - (3 * getResources().getDimensionPixelSize(R.dimen.grid_padding));
     }
+
+    private void updateThumbnail(WallpaperInfo wallpaperInfo, ImageView thumbnailView,
+                                 boolean isHomeWallpaper) {
+        if (wallpaperInfo == null) {
+            return;
+        }
+
+        if (thumbnailView == null) {
+            return;
+        }
+
+        Activity activity = getActivity();
+        if (activity == null) {
+            return;
+        }
+
+        UserEventLogger eventLogger = InjectorProvider.getInjector().getUserEventLogger(activity);
+
+        boolean renderInImageWallpaperSurface =
+                !(wallpaperInfo instanceof LiveWallpaperInfo) && isHomeWallpaper;
+        wallpaperInfo.getThumbAsset(activity.getApplicationContext())
+                .loadDrawable(activity,
+                        renderInImageWallpaperSurface ? mHomeImageWallpaper : thumbnailView,
+                        getResources().getColor(R.color.secondary_color));
+        if (isHomeWallpaper) {
+            LiveTileOverlay.INSTANCE.detach(thumbnailView.getOverlay());
+            if (wallpaperInfo instanceof LiveWallpaperInfo) {
+                setUpLiveWallpaperPreview(wallpaperInfo, thumbnailView,
+                        new ColorDrawable(getResources().getColor(
+                                R.color.secondary_color, activity.getTheme())));
+            } else {
+                if (mWallpaperConnection != null) {
+                    mWallpaperConnection.disconnect();
+                    mWallpaperConnection = null;
+                }
+            }
+        }
+        thumbnailView.setOnClickListener(view -> {
+            getFragmentHost().showViewOnlyPreview(wallpaperInfo);
+            eventLogger.logCurrentWallpaperPreviewed();
+        });
+    }
+
+    private void updateWallpaperSurface() {
+        mWallpaperSurface.getHolder().addCallback(mWallpaperSurfaceCallback);
+    }
+
+    private void updateWorkspaceSurface() {
+        mWorkspaceSurface.setZOrderMediaOverlay(true);
+        mWorkspaceSurface.getHolder().addCallback(mWorkspaceSurfaceCallback);
+    }
+
+    private final SurfaceHolder.Callback mWallpaperSurfaceCallback = new SurfaceHolder.Callback() {
+
+        @Override
+        public void surfaceCreated(@NonNull SurfaceHolder surfaceHolder) {
+            if (mHomeImageWallpaper == null) {
+                mHomeImageWallpaper = new ImageView(getContext());
+                mHomeImageWallpaper.setBackgroundColor(
+                        ContextCompat.getColor(getContext(), R.color.primary_color));
+                mHomeImageWallpaper.measure(makeMeasureSpec(mHomePreview.getWidth(), EXACTLY),
+                        makeMeasureSpec(mHomePreview.getHeight(), EXACTLY));
+                mHomeImageWallpaper.layout(0, 0, mHomePreview.getWidth(), mHomePreview.getHeight());
+
+                SurfaceControlViewHost host = new SurfaceControlViewHost(getContext(),
+                        getContext().getDisplay(), mWallpaperSurface.getHostToken());
+                host.setView(mHomeImageWallpaper, mHomeImageWallpaper.getWidth(),
+                        mHomeImageWallpaper.getHeight());
+                mWallpaperSurface.setChildSurfacePackage(host.getSurfacePackage());
+            }
+        }
+
+        @Override
+        public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        }
+
+        @Override
+        public void surfaceDestroyed(@NonNull SurfaceHolder surfaceHolder) {
+        }
+    };
+
+    private final SurfaceHolder.Callback mWorkspaceSurfaceCallback = new SurfaceHolder.Callback() {
+        @Override
+        public void surfaceCreated(SurfaceHolder holder) {
+            Bundle bundle = SurfaceViewRequestUtils.createSurfaceBundle(mWorkspaceSurface);
+            if (mPreviewUtils.supportsPreview()) {
+                mPreviewUtils.renderPreview(bundle);
+            }
+        }
+
+        @Override
+        public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) { }
+
+        @Override
+        public void surfaceDestroyed(SurfaceHolder holder) { }
+    };
 
     private interface MetadataHolder {
         /**
